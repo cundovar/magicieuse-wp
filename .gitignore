@@ -1,0 +1,56 @@
+# ===== WordPress Core =====
+/wp-admin/
+/wp-includes/
+/wp-activate.php
+/wp-blog-header.php
+/wp-comments-post.php
+/wp-cron.php
+/wp-links-opml.php
+/wp-load.php
+/wp-login.php
+/wp-mail.php
+/wp-settings.php
+/wp-signup.php
+/wp-trackback.php
+/xmlrpc.php
+/license.txt
+/readme.html
+/index.php
+
+# ===== Config sensible =====
+wp-config.php
+
+# ===== Fichiers WP auto-générés dans wp-content =====
+wp-content/index.php
+wp-content/languages/
+
+# ===== Uploads & temp =====
+wp-content/uploads/
+wp-content/upgrade/
+wp-content/upgrade-temp-backup/
+wp-content/debug.log
+wp-content/temp-write-test-*
+
+# ===== Thèmes tiers (garder uniquement lamagicieuse) =====
+wp-content/themes/*
+!wp-content/themes/lamagicieuse/
+
+# ===== Plugins tiers (garder uniquement magicieuse-headless-api) =====
+wp-content/plugins/*
+!wp-content/plugins/magicieuse-headless-api/
+
+# ===== mu-plugins (auto-généré par Elementor) =====
+wp-content/mu-plugins/
+
+# ===== Base de données =====
+BDD/
+
+# ===== IDE & outils locaux =====
+.claude/settings.local.json
+.vscode/
+.agents/
+.codex/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
