@@ -10,6 +10,102 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
+function magicieuse_get_front_url(): string {
+    $front_url = (string) get_option( 'magicieuse_front_url', 'http://localhost:5173' );
+
+    return untrailingslashit( esc_url_raw( $front_url ) );
+}
+
+function magicieuse_is_wp_page_redirect_excluded( WP_Post $page ): bool {
+    $excluded_page_ids = array_filter( array_map( 'absint', [
+        get_option( 'woocommerce_myaccount_page_id' ),
+        get_option( 'woocommerce_checkout_page_id' ),
+    ] ) );
+
+    $excluded_slugs = [
+        'mon-compte',
+        'my-account',
+        'commande',
+        'checkout',
+        'validation-de-la-commande',
+    ];
+
+    /**
+     * Permet d'ajouter d'autres pages WordPress qui doivent rester servies par WP.
+     */
+    $excluded_page_ids = apply_filters( 'magicieuse_headless_redirect_excluded_page_ids', $excluded_page_ids );
+    $excluded_slugs    = apply_filters( 'magicieuse_headless_redirect_excluded_page_slugs', $excluded_slugs );
+
+    return in_array( (int) $page->ID, $excluded_page_ids, true )
+        || in_array( $page->post_name, $excluded_slugs, true );
+}
+
+function magicieuse_get_front_path_for_page( WP_Post $page ): string {
+    if ( (int) get_option( 'page_on_front' ) === (int) $page->ID ) {
+        return '/';
+    }
+
+    return '/' . trim( get_page_uri( $page ), '/' ) . '/';
+}
+
+add_filter( 'allowed_redirect_hosts', function ( array $hosts ): array {
+    $front_host = wp_parse_url( magicieuse_get_front_url(), PHP_URL_HOST );
+
+    if ( $front_host && ! in_array( $front_host, $hosts, true ) ) {
+        $hosts[] = $front_host;
+    }
+
+    return $hosts;
+} );
+
+add_action( 'template_redirect', function (): void {
+    if ( is_admin() || wp_doing_ajax() || is_preview() || is_feed() ) {
+        return;
+    }
+
+    $front_url = magicieuse_get_front_url();
+    if ( $front_url === '' ) {
+        return;
+    }
+
+    // Catégorie produit WooCommerce → /collections/:slug/
+    if ( is_tax( 'product_cat' ) ) {
+        $term = get_queried_object();
+        if ( $term instanceof WP_Term ) {
+            wp_safe_redirect( $front_url . '/collections/' . $term->slug . '/', 302 );
+            exit;
+        }
+    }
+
+    // Produit unique WooCommerce → /produit/:slug/
+    if ( is_singular( 'product' ) ) {
+        $post = get_queried_object();
+        if ( $post instanceof WP_Post ) {
+            $slug_product = apply_filters( 'magicieuse_slug_product', 'produit' );
+            wp_safe_redirect( $front_url . '/' . $slug_product . '/' . $post->post_name . '/', 302 );
+            exit;
+        }
+    }
+
+    // Page WordPress classique
+    if ( ! is_page() ) {
+        return;
+    }
+
+    $page = get_queried_object();
+    if ( ! $page instanceof WP_Post || magicieuse_is_wp_page_redirect_excluded( $page ) ) {
+        return;
+    }
+
+    $target = $front_url . magicieuse_get_front_path_for_page( $page );
+    if ( ! empty( $_SERVER['QUERY_STRING'] ) ) {
+        $target .= '?' . sanitize_text_field( wp_unslash( $_SERVER['QUERY_STRING'] ) );
+    }
+
+    wp_safe_redirect( $target, 302 );
+    exit;
+} );
+
 /**
  * Emplacements de menu declares ici plutot que dans le theme.
  * Comme ca, si le theme change, les emplacements et l'API restent disponibles.
@@ -67,6 +163,69 @@ add_action( 'rest_api_init', function () {
         'permission_callback' => '__return_true',
     ] );
 } );
+
+/**
+ * Endpoint unifie : theme + page + blocs en une seule requete.
+ * Remplace les 3 appels separes front-page + front-page-blocks + theme.
+ *
+ * GET /wp-json/magicieuse/v1/front
+ */
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'magicieuse/v1', '/front', [
+        'methods'             => 'GET',
+        'callback'            => 'magicieuse_rest_get_front',
+        'permission_callback' => '__return_true',
+    ] );
+} );
+
+function magicieuse_rest_get_front() {
+    $cached = get_transient( 'magicieuse_front' );
+    if ( $cached !== false ) {
+        return $cached;
+    }
+
+    $front_page_id = (int) get_option( 'page_on_front' );
+    $theme         = (string) get_option( 'magicieuse_active_theme', 'magicieuse' );
+
+    if ( ! $front_page_id ) {
+        return new WP_Error(
+            'no_front_page',
+            "Aucune page d'accueil statique n'est definie dans Reglages > Lecture",
+            [ 'status' => 404 ]
+        );
+    }
+
+    $page = get_post( $front_page_id );
+
+    if ( ! $page || $page->post_type !== 'page' || $page->post_status !== 'publish' ) {
+        return new WP_Error( 'front_page_not_found', "Page d'accueil introuvable", [ 'status' => 404 ] );
+    }
+
+    global $post;
+    $post = $page;
+    setup_postdata( $post );
+    $content = apply_filters( 'the_content', $page->post_content );
+    $excerpt = $page->post_excerpt ?: wp_trim_excerpt( '', $page );
+    wp_reset_postdata();
+
+    $response = [
+        'theme'  => $theme,
+        'page'   => [
+            'id'      => $page->ID,
+            'slug'    => $page->post_name,
+            'type'    => 'page',
+            'title'   => $page->post_title,
+            'content' => $content,
+            'excerpt' => $excerpt,
+            'date'    => $page->post_date,
+        ],
+        'blocks' => magicieuse_rest_build_blocks_payload( $page, 'page' ),
+    ];
+
+    set_transient( 'magicieuse_front', $response, HOUR_IN_SECONDS );
+
+    return $response;
+}
 
 /**
  * Endpoint REST pour reprendre le template page_artistes.php en headless.
@@ -395,6 +554,11 @@ function magicieuse_rest_get_artistes() {
 }
 
 function magicieuse_rest_get_front_page() {
+    $cached = get_transient( 'magicieuse_front_page' );
+    if ( $cached !== false ) {
+        return $cached;
+    }
+
     $front_page_id = (int) get_option( 'page_on_front' );
 
     if ( ! $front_page_id ) {
@@ -420,7 +584,7 @@ function magicieuse_rest_get_front_page() {
 
     wp_reset_postdata();
 
-    return [
+    $response = [
         'id'      => $page->ID,
         'slug'    => $page->post_name,
         'type'    => 'page',
@@ -429,9 +593,18 @@ function magicieuse_rest_get_front_page() {
         'excerpt' => $excerpt,
         'date'    => $page->post_date,
     ];
+
+    set_transient( 'magicieuse_front_page', $response, HOUR_IN_SECONDS );
+
+    return $response;
 }
 
 function magicieuse_rest_get_front_page_blocks() {
+    $cached = get_transient( 'magicieuse_front_blocks' );
+    if ( $cached !== false ) {
+        return $cached;
+    }
+
     $front_page_id = (int) get_option( 'page_on_front' );
 
     if ( ! $front_page_id ) {
@@ -448,7 +621,10 @@ function magicieuse_rest_get_front_page_blocks() {
         return new WP_Error( 'front_page_not_found', "Page d'accueil introuvable", [ 'status' => 404 ] );
     }
 
-    return magicieuse_rest_build_blocks_payload( $page, 'page' );
+    $response = magicieuse_rest_build_blocks_payload( $page, 'page' );
+    set_transient( 'magicieuse_front_blocks', $response, HOUR_IN_SECONDS );
+
+    return $response;
 }
 
 function magicieuse_rest_build_blocks_payload( WP_Post $post, string $type = 'page' ): array {
@@ -490,6 +666,15 @@ function magicieuse_rest_enrich_block( array $block ) {
         ];
     }
 
+    if (
+        in_array( $name, [ 'magicieuse/hero', 'magicieuse/image-text' ], true )
+        && ! empty( $attrs['imageId'] )
+    ) {
+        return [
+            'image' => magicieuse_rest_get_image_for_react( (int) $attrs['imageId'] ),
+        ];
+    }
+
     if ( $name === 'core/buttons' ) {
         return [
             'buttons' => magicieuse_rest_get_buttons_for_react( $block['innerBlocks'] ?? [] ),
@@ -508,6 +693,7 @@ function magicieuse_rest_enrich_block( array $block ) {
             'woocommerce/handpicked-products',
             'woocommerce/products-by-category',
             'magicieuse/featured-products',
+            'magicieuse/book-carousel',
         ], true )
     ) {
         $products = magicieuse_rest_get_products_for_block( $block );
@@ -515,6 +701,44 @@ function magicieuse_rest_enrich_block( array $block ) {
         return [
             'products' => $products,
         ];
+    }
+
+    if ( $name === 'magicieuse/gallery' ) {
+        return [
+            'images' => magicieuse_rest_get_images_for_block( $block ),
+        ];
+    }
+
+    if ( $name === 'magicieuse/category-grid' ) {
+        return [
+            'categories' => magicieuse_rest_get_categories_for_block( $block ),
+        ];
+    }
+
+    if ( $name === 'magicieuse/product-highlight' ) {
+        $product = magicieuse_rest_get_product_highlight_for_block( $block );
+
+        return [
+            'product' => $product,
+        ];
+    }
+
+    if ( $name === 'magicieuse/slider' ) {
+        $slides_raw = $attrs['slides'] ?? null;
+
+        if ( ! is_array( $slides_raw ) ) {
+            return null; // Format legacy pipe-texte — géré côté React
+        }
+
+        $slides = array_map( function ( $slide ) {
+            $slide = (array) $slide;
+            $slide['image'] = ! empty( $slide['imageId'] )
+                ? magicieuse_rest_get_image_for_react( (int) $slide['imageId'] )
+                : null;
+            return $slide;
+        }, $slides_raw );
+
+        return [ 'slides' => $slides ];
     }
 
     return null;
@@ -594,11 +818,17 @@ function magicieuse_rest_get_products_for_block( array $block ): array {
     $ids   = [];
 
     foreach ( [ 'products', 'productIds', 'ids' ] as $key ) {
-        if ( empty( $attrs[ $key ] ) || ! is_array( $attrs[ $key ] ) ) {
+        if ( empty( $attrs[ $key ] ) ) {
             continue;
         }
 
-        $ids = array_map( 'absint', $attrs[ $key ] );
+        if ( is_array( $attrs[ $key ] ) ) {
+            $ids = array_map( 'absint', $attrs[ $key ] );
+        } else {
+            $ids = array_filter(
+                array_map( 'absint', preg_split( '/\s*,\s*/', (string) $attrs[ $key ] ) )
+            );
+        }
         break;
     }
 
@@ -606,15 +836,44 @@ function magicieuse_rest_get_products_for_block( array $block ): array {
         $ids = [ absint( $attrs['productId'] ) ];
     }
 
-    if ( empty( $ids ) ) {
-        return [];
-    }
-
     $products = [];
 
-    foreach ( $ids as $id ) {
-        $product = wc_get_product( $id );
-        if ( ! $product || $product->get_status() !== 'publish' ) {
+    if ( ! empty( $ids ) ) {
+        foreach ( $ids as $id ) {
+            $product = wc_get_product( $id );
+            if ( ! $product || $product->get_status() !== 'publish' ) {
+                continue;
+            }
+
+            $products[] = magicieuse_rest_get_product_for_react( $product );
+        }
+
+        return $products;
+    }
+
+    $limit    = ! empty( $attrs['count'] ) ? max( 1, min( 24, absint( $attrs['count'] ) ) ) : 8;
+    $category = ! empty( $attrs['category'] ) ? sanitize_title( (string) $attrs['category'] ) : '';
+    $mode     = ! empty( $attrs['mode'] ) ? sanitize_key( (string) $attrs['mode'] ) : '';
+
+    $query_args = [
+        'status' => 'publish',
+        'limit'  => $limit,
+        'orderby' => 'date',
+        'order'  => 'DESC',
+    ];
+
+    if ( $category !== '' ) {
+        $query_args['category'] = [ $category ];
+    }
+
+    if ( $mode === 'featured' ) {
+        $query_args['featured'] = true;
+    }
+
+    $queried_products = wc_get_products( $query_args );
+
+    foreach ( $queried_products as $product ) {
+        if ( ! $product instanceof WC_Product ) {
             continue;
         }
 
@@ -622,6 +881,82 @@ function magicieuse_rest_get_products_for_block( array $block ): array {
     }
 
     return $products;
+}
+
+function magicieuse_rest_get_images_for_block( array $block ): array {
+    $attrs = $block['attrs'] ?? [];
+    $ids   = [];
+
+    if ( ! empty( $attrs['imageIds'] ) ) {
+        $ids = array_filter(
+            array_map( 'absint', preg_split( '/\s*,\s*/', (string) $attrs['imageIds'] ) )
+        );
+    }
+
+    $images = [];
+    foreach ( $ids as $id ) {
+        $image = magicieuse_rest_get_image_for_react( $id );
+        if ( $image ) {
+            $images[] = $image;
+        }
+    }
+
+    return $images;
+}
+
+function magicieuse_rest_get_categories_for_block( array $block ): array {
+    $attrs = $block['attrs'] ?? [];
+    $limit = ! empty( $attrs['count'] ) ? max( 1, min( 24, absint( $attrs['count'] ) ) ) : 8;
+    $slugs = [];
+
+    if ( ! empty( $attrs['categorySlugs'] ) ) {
+        $slugs = array_filter(
+            array_map( 'sanitize_title', preg_split( '/\s*,\s*/', (string) $attrs['categorySlugs'] ) )
+        );
+    }
+
+    $terms = get_terms( [
+        'taxonomy'   => 'product_cat',
+        'hide_empty' => false,
+        'number'     => empty( $slugs ) ? $limit : 0,
+        'slug'       => empty( $slugs ) ? '' : $slugs,
+        'orderby'    => 'name',
+        'order'      => 'ASC',
+    ] );
+
+    if ( is_wp_error( $terms ) ) {
+        return [];
+    }
+
+    return array_map( function ( WP_Term $term ) {
+        $thumbnail_id = (int) get_term_meta( $term->term_id, 'thumbnail_id', true );
+
+        return [
+            'id'          => $term->term_id,
+            'name'        => $term->name,
+            'slug'        => $term->slug,
+            'description' => $term->description,
+            'count'       => $term->count,
+            'image'       => $thumbnail_id ? magicieuse_rest_get_image_for_react( $thumbnail_id ) : null,
+        ];
+    }, $terms );
+}
+
+function magicieuse_rest_get_product_highlight_for_block( array $block ): ?array {
+    $attrs      = $block['attrs'] ?? [];
+    $product_id = ! empty( $attrs['productId'] ) ? absint( $attrs['productId'] ) : 0;
+
+    if ( ! $product_id ) {
+        return null;
+    }
+
+    $product = wc_get_product( $product_id );
+
+    if ( ! $product || $product->get_status() !== 'publish' ) {
+        return null;
+    }
+
+    return magicieuse_rest_get_product_for_react( $product );
 }
 
 function magicieuse_rest_get_product_for_react( WC_Product $product ): array {
@@ -821,8 +1156,128 @@ add_action( 'rest_api_init', function () {
     ] );
 } );
 
+/**
+ * Thème front — liste des thèmes disponibles (extensible via filtre).
+ */
+function magicieuse_get_available_themes(): array {
+    return apply_filters( 'magicieuse_available_themes', [
+        'magicieuse'       => 'Magicieuse — Dark Luxury',
+        'magicieuse-clair' => 'Magicieuse — Clair & Coloré',
+        'field-folio'      => 'Field & Folio — Éditorial',
+    ] );
+}
+
+/**
+ * GET /wp-json/magicieuse/v1/theme — retourne le thème actif (public).
+ * POST /wp-json/magicieuse/v1/theme — met à jour le thème (admin uniquement).
+ */
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'magicieuse/v1', '/theme', [
+        [
+            'methods'             => 'GET',
+            'callback'            => function () {
+                return [ 'theme' => get_option( 'magicieuse_active_theme', 'magicieuse' ) ];
+            },
+            'permission_callback' => '__return_true',
+        ],
+        [
+            'methods'             => 'POST',
+            'callback'            => function ( WP_REST_Request $req ) {
+                $theme     = sanitize_key( $req->get_param( 'theme' ) );
+                $available = array_keys( magicieuse_get_available_themes() );
+
+                if ( ! in_array( $theme, $available, true ) ) {
+                    return new WP_Error( 'invalid_theme', 'Thème inconnu.', [ 'status' => 400 ] );
+                }
+
+                update_option( 'magicieuse_active_theme', $theme );
+                magicieuse_flush_front_cache();
+                return [ 'theme' => $theme ];
+            },
+            'permission_callback' => fn() => current_user_can( 'manage_options' ),
+            'args'                => [
+                'theme' => [ 'required' => true, 'type' => 'string' ],
+            ],
+        ],
+    ] );
+} );
+
+/**
+ * Page admin Réglages > Thème front.
+ */
+add_action( 'admin_menu', function () {
+    add_options_page(
+        'Thème front',
+        'Thème front',
+        'manage_options',
+        'magicieuse-theme',
+        'magicieuse_theme_settings_page'
+    );
+} );
+
+function magicieuse_theme_settings_page(): void {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return;
+    }
+
+    $notice = '';
+
+    if (
+        isset( $_POST['magicieuse_theme_nonce'] ) &&
+        wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['magicieuse_theme_nonce'] ) ), 'magicieuse_save_theme' )
+    ) {
+        $theme     = sanitize_key( $_POST['magicieuse_active_theme'] ?? '' );
+        $available = array_keys( magicieuse_get_available_themes() );
+
+        if ( in_array( $theme, $available, true ) ) {
+            update_option( 'magicieuse_active_theme', $theme );
+            magicieuse_flush_front_cache();
+            $notice = '<div class="notice notice-success is-dismissible"><p>Thème enregistré.</p></div>';
+        } else {
+            $notice = '<div class="notice notice-error"><p>Thème invalide.</p></div>';
+        }
+    }
+
+    $current = get_option( 'magicieuse_active_theme', 'magicieuse' );
+    $themes  = magicieuse_get_available_themes();
+    ?>
+    <div class="wrap">
+        <h1>Thème du front React</h1>
+        <?php echo wp_kses_post( $notice ); ?>
+        <form method="post">
+            <?php wp_nonce_field( 'magicieuse_save_theme', 'magicieuse_theme_nonce' ); ?>
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row"><label for="magicieuse_active_theme">Thème actif</label></th>
+                    <td>
+                        <select name="magicieuse_active_theme" id="magicieuse_active_theme">
+                            <?php foreach ( $themes as $key => $label ) : ?>
+                                <option value="<?php echo esc_attr( $key ); ?>" <?php selected( $current, $key ); ?>>
+                                    <?php echo esc_html( $label ); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                        <p class="description">
+                            Le front React applique ce thème au prochain chargement de page.
+                            Prévisualiser sur <a href="<?php echo esc_url( home_url( '/' ) ); ?>" target="_blank">le site</a>.
+                        </p>
+                    </td>
+                </tr>
+            </table>
+            <?php submit_button( 'Enregistrer le thème' ); ?>
+        </form>
+    </div>
+    <?php
+}
+
 function magicieuse_rest_get_menu( WP_REST_Request $request ) {
     $location  = $request->get_param( 'location' );
+    $cache_key = 'magicieuse_menu_' . $location;
+    $cached    = get_transient( $cache_key );
+    if ( $cached !== false ) {
+        return $cached;
+    }
+
     $locations = get_nav_menu_locations();
 
     if ( empty( $locations[ $location ] ) ) {
@@ -840,7 +1295,7 @@ function magicieuse_rest_get_menu( WP_REST_Request $request ) {
 
     $site_url = rtrim( home_url( '/' ), '/' );
 
-    return array_values( array_map( function ( WP_Post $item ) use ( $site_url ) {
+    $result = array_values( array_map( function ( WP_Post $item ) use ( $site_url ) {
         $url         = $item->url;
         $object_type = $item->object; // 'page', 'post', 'product_cat', 'custom', ...
         $is_external = strpos( $url, $site_url ) !== 0;
@@ -869,4 +1324,50 @@ function magicieuse_rest_get_menu( WP_REST_Request $request ) {
             'object_type' => $object_type,
         ];
     }, $items ) );
+
+    set_transient( $cache_key, $result, HOUR_IN_SECONDS );
+
+    return $result;
 }
+
+// ---------------------------------------------------------------------------
+// Gestion du cache — invalidation automatique
+// ---------------------------------------------------------------------------
+
+function magicieuse_flush_front_cache(): void {
+    delete_transient( 'magicieuse_front' );
+    delete_transient( 'magicieuse_front_page' );
+    delete_transient( 'magicieuse_front_blocks' );
+}
+
+function magicieuse_flush_menu_cache(): void {
+    foreach ( array_keys( get_nav_menu_locations() ) as $location ) {
+        delete_transient( 'magicieuse_menu_' . $location );
+    }
+}
+
+// Page d'accueil modifiee → vider le cache front
+add_action( 'save_post_page', function ( int $post_id ): void {
+    if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
+        return;
+    }
+    if ( (int) get_option( 'page_on_front' ) === $post_id ) {
+        magicieuse_flush_front_cache();
+    }
+} );
+
+// Categorie produit modifiee → vider le cache front (bloc category-grid)
+add_action( 'edited_product_cat', function (): void {
+    magicieuse_flush_front_cache();
+} );
+add_action( 'created_product_cat', function (): void {
+    magicieuse_flush_front_cache();
+} );
+add_action( 'deleted_product_cat', function (): void {
+    magicieuse_flush_front_cache();
+} );
+
+// Menu modifie → vider le cache menus
+add_action( 'wp_update_nav_menu', function (): void {
+    magicieuse_flush_menu_cache();
+} );
