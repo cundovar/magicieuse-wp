@@ -1,0 +1,41 @@
+name: Deploy WordPress custom code to OVH
+
+on:
+  push:
+    branches:
+      - deploy
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      OVH_HOST: ssh.cluster130.hosting.ovh.net
+      OVH_USER: egflbug
+      OVH_ROOT: /homez.1574/egflbug/magicieuse/back/htdocs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.OVH_SSH_KEY }}" > ~/.ssh/ovh_deploy_key
+          chmod 600 ~/.ssh/ovh_deploy_key
+          ssh-keyscan -H "$OVH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy theme
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/ovh_deploy_key -o IdentitiesOnly=yes" \
+            wp-content/themes/lamagicieuse/ \
+            "$OVH_USER@$OVH_HOST:$OVH_ROOT/wp-content/themes/lamagicieuse/"
+
+      - name: Deploy custom plugin
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/ovh_deploy_key -o IdentitiesOnly=yes" \
+            wp-content/plugins/magicieuse-headless-api/ \
+            "$OVH_USER@$OVH_HOST:$OVH_ROOT/wp-content/plugins/magicieuse-headless-api/"
