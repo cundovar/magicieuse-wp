@@ -2,13 +2,27 @@
 /**
  * Plugin Name: Magicieuse Headless API
  * Description: Endpoints REST et emplacements de menu pour le front headless React.
- * Version:     1.0.0
+ * Version:     1.0.1
  * Author:      Magicieuse
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
+
+const MAGICIEUSE_ARTIST_CACHE_VERSION = '2';
+
+function magicieuse_maybe_invalidate_artist_cache(): void {
+    if ( get_option( 'magicieuse_artist_cache_version' ) === MAGICIEUSE_ARTIST_CACHE_VERSION ) {
+        return;
+    }
+
+    delete_transient( 'magicieuse_artistes' );
+    delete_transient( 'magicieuse_content_' . md5( 'artistes' ) );
+    update_option( 'magicieuse_artist_cache_version', MAGICIEUSE_ARTIST_CACHE_VERSION, false );
+}
+
+add_action( 'init', 'magicieuse_maybe_invalidate_artist_cache', 1 );
 
 function magicieuse_get_front_url(): string {
     $front_url = (string) get_option( 'magicieuse_front_url', 'http://localhost:5173' );
