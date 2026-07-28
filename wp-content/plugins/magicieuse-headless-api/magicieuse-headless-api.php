@@ -10,7 +10,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-const MAGICIEUSE_ARTIST_CACHE_VERSION = '2';
+const MAGICIEUSE_ARTIST_CACHE_VERSION = '3';
 
 function magicieuse_maybe_invalidate_artist_cache(): void {
     if ( get_option( 'magicieuse_artist_cache_version' ) === MAGICIEUSE_ARTIST_CACHE_VERSION ) {
@@ -23,6 +23,10 @@ function magicieuse_maybe_invalidate_artist_cache(): void {
 }
 
 add_action( 'init', 'magicieuse_maybe_invalidate_artist_cache', 1 );
+
+function magicieuse_get_artist_content_version(): string {
+    return (string) ( get_lastpostmodified( 'GMT', 'artiste_s' ) ?: '0' );
+}
 
 function magicieuse_get_front_url(): string {
     $front_url = (string) get_option( 'magicieuse_front_url', 'http://localhost:5173' );
@@ -493,6 +497,9 @@ add_action( 'rest_api_init', function () {
 function magicieuse_rest_get_content( WP_REST_Request $request ) {
     $slug      = $request->get_param( 'slug' );
     $cache_key = 'magicieuse_content_' . md5( $slug );
+    if ( $slug === 'artistes' ) {
+        $cache_key .= '_' . md5( magicieuse_get_artist_content_version() );
+    }
     $cached    = get_transient( $cache_key );
     if ( $cached !== false ) {
         return $cached;
@@ -633,29 +640,36 @@ function magicieuse_render_artistes_html(): string {
     while ( $query->have_posts() ) {
         $query->the_post();
         $artist_id = get_the_ID();
-        $title     = magicieuse_normalize_text_field(
-            magicieuse_get_custom_field( 'titre', $artist_id )
-        );
+        $title     = magicieuse_normalize_text_field( get_the_title( $artist_id ) );
 
         if ( $title === '' ) {
-            $title = get_the_title( $artist_id );
+            $title = magicieuse_normalize_text_field(
+                magicieuse_get_custom_field( 'titre', $artist_id )
+            );
         }
+
+        $post_content     = (string) get_post_field( 'post_content', $artist_id );
+        $has_post_content = trim( wp_strip_all_tags( $post_content ) ) !== '';
         ?>
         <div class="content_artiste">
             <div class="card-artiste">
                 <h1 class="titre-artiste"><?php echo esc_html( $title ); ?></h1>
                 <div class="text-artiste">
-                    <?php foreach ( $paragraph_fields as $field_name ) : ?>
-                        <?php
-                        $paragraph = magicieuse_get_custom_field( $field_name, $artist_id );
-                        $paragraph = is_array( $paragraph )
-                            ? magicieuse_normalize_text_field( $paragraph )
-                            : trim( (string) $paragraph );
-                        ?>
-                        <?php if ( $paragraph !== '' ) : ?>
-                            <?php echo wp_kses_post( wpautop( $paragraph ) ); ?>
-                        <?php endif; ?>
-                    <?php endforeach; ?>
+                    <?php if ( $has_post_content ) : ?>
+                        <?php echo wp_kses_post( apply_filters( 'the_content', $post_content ) ); ?>
+                    <?php else : ?>
+                        <?php foreach ( $paragraph_fields as $field_name ) : ?>
+                            <?php
+                            $paragraph = magicieuse_get_custom_field( $field_name, $artist_id );
+                            $paragraph = is_array( $paragraph )
+                                ? magicieuse_normalize_text_field( $paragraph )
+                                : trim( (string) $paragraph );
+                            ?>
+                            <?php if ( $paragraph !== '' ) : ?>
+                                <?php echo wp_kses_post( wpautop( $paragraph ) ); ?>
+                            <?php endif; ?>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
 
                     <?php foreach ( $link_fields as $field_name ) : ?>
                         <?php $link = magicieuse_normalize_link_field( magicieuse_get_custom_field( $field_name, $artist_id ) ); ?>
@@ -734,7 +748,8 @@ function magicieuse_render_blog_html(): string {
 }
 
 function magicieuse_rest_get_artistes() {
-    $cached = get_transient( 'magicieuse_artistes' );
+    $cache_key = 'magicieuse_artistes_' . md5( magicieuse_get_artist_content_version() );
+    $cached    = get_transient( $cache_key );
     if ( $cached !== false ) {
         return $cached;
     }
@@ -771,13 +786,33 @@ function magicieuse_rest_get_artistes() {
             'lien-8',
         ];
 
-        $paragraphs = [];
-        foreach ( $paragraph_fields as $field_name ) {
-            $text = magicieuse_normalize_text_field(
-                magicieuse_get_custom_field( $field_name, $artist->ID )
-            );
-            if ( $text !== '' ) {
-                $paragraphs[] = $text;
+        $paragraphs  = [];
+        $post_content = (string) $artist->post_content;
+        if ( trim( wp_strip_all_tags( $post_content ) ) !== '' ) {
+            $rendered_content = apply_filters( 'the_content', $post_content );
+            preg_match_all( '/<p\b[^>]*>(.*?)<\/p>/is', $rendered_content, $matches );
+
+            foreach ( $matches[1] ?? [] as $paragraph ) {
+                $text = magicieuse_normalize_text_field( $paragraph );
+                if ( $text !== '' ) {
+                    $paragraphs[] = $text;
+                }
+            }
+
+            if ( $paragraphs === [] ) {
+                $text = magicieuse_normalize_text_field( $rendered_content );
+                if ( $text !== '' ) {
+                    $paragraphs[] = $text;
+                }
+            }
+        } else {
+            foreach ( $paragraph_fields as $field_name ) {
+                $text = magicieuse_normalize_text_field(
+                    magicieuse_get_custom_field( $field_name, $artist->ID )
+                );
+                if ( $text !== '' ) {
+                    $paragraphs[] = $text;
+                }
             }
         }
 
@@ -791,14 +826,17 @@ function magicieuse_rest_get_artistes() {
             }
         }
 
-        $acf_title = magicieuse_normalize_text_field(
-            magicieuse_get_custom_field( 'titre', $artist->ID )
-        );
+        $title = magicieuse_normalize_text_field( $artist->post_title );
+        if ( $title === '' ) {
+            $title = magicieuse_normalize_text_field(
+                magicieuse_get_custom_field( 'titre', $artist->ID )
+            );
+        }
 
         $artistes[] = [
             'id'         => $artist->ID,
             'slug'       => $artist->post_name,
-            'title'      => $acf_title !== '' ? $acf_title : $artist->post_title,
+            'title'      => $title,
             'paragraphs' => $paragraphs,
             'links'      => $links,
         ];
@@ -808,7 +846,7 @@ function magicieuse_rest_get_artistes() {
 
     shuffle( $artistes );
 
-    set_transient( 'magicieuse_artistes', $artistes, HOUR_IN_SECONDS );
+    set_transient( $cache_key, $artistes, HOUR_IN_SECONDS );
 
     return $artistes;
 }
