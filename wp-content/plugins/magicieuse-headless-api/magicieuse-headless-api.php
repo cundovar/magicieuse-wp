@@ -68,6 +68,13 @@ add_filter( 'rest_post_dispatch', function ( WP_REST_Response $response, WP_REST
         return $response;
     }
 
+    if ( in_array( $route, [ '/magicieuse/v1/artistes', '/magicieuse/v1/content/artistes' ], true ) ) {
+        $response->header( 'Cache-Control', 'private, no-cache, no-store, max-age=0, must-revalidate' );
+        $response->header( 'Vary', 'Accept-Encoding' );
+
+        return $response;
+    }
+
     $response->header( 'Cache-Control', 'public, max-age=300, stale-while-revalidate=3600' );
     $response->header( 'Vary', 'Accept-Encoding' );
 
@@ -2423,6 +2430,7 @@ add_action( 'save_post_artiste_s', function ( int $post_id ): void {
         return;
     }
     delete_transient( 'magicieuse_artistes' );
+    delete_transient( 'magicieuse_content_' . md5( 'artistes' ) );
 } );
 
 // Produit modifie → vider les caches brands du slug correspondant
